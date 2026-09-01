@@ -1,0 +1,8 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+huggingface_cache/
+paddlex_cache/
+uploaded_files/

@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+uploaded_files/
+#huggingface_cache/
+#paddlex_cache/
+*.log
+.pytest_cache/

@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy
+psycopg2-binary
+pgvector
+pydantic
+python-dotenv
+sentence-transformers
+llama-index-core
+google-genai
+PyMuPDF          # fitz
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+pdf2image
+camelot-py[cv]
+Pillow
+numpy
+httpx
+requests
