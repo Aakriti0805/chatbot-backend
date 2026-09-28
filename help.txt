@@ -1,0 +1,73 @@
+# Railway Chatbot Backend - Run Commands (Windows PowerShell)
+
+# 1) Go to backend folder
+cd d:\chatbot\backend
+
+# 2) Create virtual environment
+python -m venv .venv
+
+# 3) Activate virtual environment
+.\.venv\Scripts\Activate.ps1
+
+# 4) Upgrade pip and install dependencies
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# 5) Make sure PostgreSQL is running and database exists
+# This project connects to:
+# DATABASE_URL = postgresql://postgres:akku2005@localhost:5432/chatbot_db
+
+# Optional: start PostgreSQL in Docker
+# docker run --name chatbot-db -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=your_db_password -e POSTGRES_DB=chatbot_db -p 5432:5432 -d postgres:16
+
+# 6) Create tables in database
+python create_tables.py
+
+# 7) Start FastAPI backend
+uvicorn app.main:app --host 0.0.0.0 --port 8002
+
+# Alternative command
+# python -m uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+
+# 8) Check backend is running
+# Open in browser:
+# http://localhost:8000/
+# or test using:
+# curl http://localhost:8000/
+
+# 9) Run CRIS PDF ingestion script
+# This downloads PDFs from the CRIS source database and saves them into uploaded_files/cris_sync
+cd d:\chatbot\backend
+.\.venv\Scripts\Activate.ps1
+python app\ingest_cris_pdfs.py
+
+# Alternative if venv is already active:
+# python app\ingest_cris_pdfs.py
+
+# Notes:
+# - This script connects to the CRIS database using:
+#   host=localhost, port=5432, dbname=cris_data, user=postgres, pass word=akku2005
+# - Make sure PostgreSQL is running and the database 'cris_data' exists before executing the script.
+# - If .venv is already created, skip step 2.
+# - If you are using Linux/macOS, activate with: source .venv/bin/activate
+# - If you get database connection errors, verify PostgreSQL is running on port 5432 and database chatbot_db exists.
+
+# New query features
+# - Create a conversation: POST http://localhost:8002/query/conversations
+# - Ask a follow-up: GET http://localhost:8002/query/ask?conversation_id=1&question=list%20them
+# - Read conversation history: GET http://localhost:8002/query/conversations/1
+# - List indexed documents (metadata/counts, separate from answer sources):
+#   GET http://localhost:8002/documents
+# - Check Gemini residency configuration:
+#   GET http://localhost:8002/query/data-residency
+#
+# Optional .env flags:
+# GEMINI_DATA_RESIDENCY_CONFIRMED=false
+# LLM_PROVIDER=gemini
+# Set GEMINI_DATA_RESIDENCY_CONFIRMED=true only after confirming India-only
+# storage/processing terms in the applicable Google contract or policy. The
+# local provider is only a configuration boundary until a local LLM adapter is added.
+
+
+
+

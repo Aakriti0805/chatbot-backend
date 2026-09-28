@@ -20,9 +20,7 @@ _HTTP_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 oauth2_scheme = HTTPBearer()
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+
 async def _validate_with_roams(token: str) -> httpx.Response:
     """Calls ROAMS validation endpoint with the token exactly as received."""
     try:
@@ -87,11 +85,7 @@ async def _fetch_role_from_user_info(token: str, user_id: str) -> str:
     return role
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 — Authentication (token -> identity)
-# Same name/shape as before (get_current_user) so existing routes that do
-# `Depends(auth.get_current_user)` don't need to change.
-# ---------------------------------------------------------------------------
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme),
 ) -> dict:
@@ -99,7 +93,6 @@ async def get_current_user(
 
     response = await _validate_with_roams(token)
 
-    # Explicit status check — do not rely on library "throw on non-2xx" behavior.
     if response.status_code < 200 or response.status_code >= 300:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -124,11 +117,7 @@ async def get_current_user(
     return {"user_id": user_id, "role": role}
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 — Authorization (identity -> permission)
-# Same name as before (get_current_admin) so existing admin-only routes
-# that do `Depends(auth.get_current_admin)` keep working unchanged.
-# ---------------------------------------------------------------------------
+
 def get_current_admin(current_user: dict = Depends(get_current_user)) -> dict:
     if current_user["role"] != "admin":
         raise HTTPException(

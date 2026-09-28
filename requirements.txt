@@ -11,10 +11,10 @@ llama-index-core
 google-genai
 PyMuPDF          # fitz
 paddlepaddle==3.3.1
-paddleocr==3.7.0
-paddlex==3.7.2
+paddleocr[doc-parser]==3.7.0
+paddlex[ocr]==3.7.2
 pdf2image
-camelot-py[cv]
+python-docx
 Pillow
 numpy
 httpx

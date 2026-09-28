@@ -5,8 +5,11 @@ from paddleocr import PaddleOCR  # type: ignore
 from pdf2image import convert_from_path  # type: ignore
 from PIL import Image
 import io
+import os
 
 ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", enable_mkldnn=False)
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def sort_ocr_by_position(rec_texts, rec_boxes, y_tolerance=15):
@@ -47,9 +50,7 @@ def run_ocr(image_np):
 
     page_result = result[0]
 
-    # kabhi kabhi PaddleOCR empty/no-detection pe raw numpy array
-    # ya None return karta hai instead of dict-like OCRResult —
-    # usko yahi filter kar do, bool() mat lagao directly
+    
     if page_result is None or not hasattr(page_result, "get"):
         return ""
 
@@ -59,10 +60,7 @@ def run_ocr(image_np):
     if rec_boxes is not None and len(rec_boxes) > 0:
         return sort_ocr_by_position(rec_texts, rec_boxes)
 
-    # FIX: rec_texts can be a NumPy array in newer PaddleOCR versions.
-    # `if rec_texts:` raises "truth value of an array with more than
-    # one element is ambiguous" on multi-element arrays — always check
-    # length explicitly instead.
+    
     if len(rec_texts) > 0:
         return "\n".join(rec_texts)
 
@@ -161,3 +159,20 @@ def extract_text_from_image(filepath: str) -> list[dict]:
             "text": ocr_text.strip()
         }
     ]
+
+
+def extract_text_from_plain_text(text: str) -> list[dict]:
+    """Direct text input (no file uploaded) — no extraction needed."""
+    return [{"page_number": 1, "text": text.strip()}]
+
+
+def process_file(filepath: str) -> list[dict]:
+    """Entry point — routes to the right extractor based on file extension."""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == ".pdf":
+        return extract_text_from_pdf(filepath)
+    elif ext in IMAGE_EXTENSIONS:
+        return extract_text_from_image(filepath)
+    else:
+        raise ValueError(f"Unsupported file type for ingestion: {ext}")

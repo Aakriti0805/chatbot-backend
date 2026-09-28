@@ -1,19 +1,44 @@
-from app.services.textextraction_service import extract_text_from_pdf
+from app.services.textextraction_service import process_file, extract_text_from_plain_text
 from app.services.chunking_services import chunk_text
 from app.services.embedding_service import generate_embeddings
-from app.services.llm_service import extract_metadata  
+from app.services.llm_service import extract_metadata
 from app.models import Chunk, Document
 from sqlalchemy.orm import Session
 
 
-def process_document(filepath: str, document_id: int, db: Session, pre_extracted_pages: list[dict] | None = None):
+def _sanitize_text(text: str) -> str:
+    if not text:
+        return text
+    text = text.replace("\x00", "")
+    return "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
 
-    # Use already-extracted pages if provided (from parallel batch extraction),
-    # otherwise fall back to extracting them here (e.g. for old/other callers).
+
+def process_document(
+    document_id: int,
+    db: Session,
+    filepath: str | None = None,
+    raw_text: str | None = None,
+    pre_extracted_pages: list[dict] | None = None,
+):
+    """
+    Supports three ingestion paths:
+      - pre_extracted_pages: already-extracted pages (e.g. from parallel batch extraction)
+      - filepath: PDF / image (jpg, jpeg, png) / DOCX — process_file() routes it to
+        the right extractor automatically
+      - raw_text: direct text input (no file, user supplied text directly)
+
+    NOTE: this function used to take a positional `filepath` argument and call
+    extract_text_from_pdf() directly — callers now need to use the new
+    keyword-argument style (filepath=..., or raw_text=...).
+    """
     if pre_extracted_pages is not None:
         pages_text = pre_extracted_pages
+    elif raw_text is not None:
+        pages_text = extract_text_from_plain_text(raw_text)
+    elif filepath is not None:
+        pages_text = process_file(filepath=filepath)
     else:
-        pages_text = extract_text_from_pdf(filepath)
+        raise ValueError("Provide one of: filepath, raw_text, or pre_extracted_pages")
 
     sample_text = " ".join([p["text"] for p in pages_text[:3]])
     metadata = extract_metadata(sample_text)
@@ -26,19 +51,17 @@ def process_document(filepath: str, document_id: int, db: Session, pre_extracted
         document.doc_date = metadata.get("doc_date")
         db.commit()
 
-    # Step 3: Chunking — split text into semantically coherent chunks
     chunks = chunk_text(pages_text)
 
-    # Step 4: Embeddings — generate a vector for each chunk
-    texts = [c["text"] for c in chunks]
+    
+    texts = [_sanitize_text(c["text"]) for c in chunks]
     embeddings = generate_embeddings(texts)
 
-    # Step 5: Save all chunks + embeddings to the database
-    for chunk, embedding in zip(chunks, embeddings):
+    for chunk, text, embedding in zip(chunks, texts, embeddings):
         db_chunk = Chunk(
             document_id=document_id,
             page_number=chunk["page_number"],
-            text=chunk["text"],
+            text=text,
             embedding=embedding
         )
         db.add(db_chunk)
