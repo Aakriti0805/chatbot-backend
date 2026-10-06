@@ -4,12 +4,17 @@ import json
 import time
 import logging
 import threading
+import warnings
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import exc as sa_exc
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from app.services.llm_service import client, GEMINI_MODEL
+from app.database import SessionLocal as _MetaSession
+from app.services.llm_service import LLMUnavailableError, generate_json, generate_text
+from app.services.embedding_service import generate_query_embedding
+from app.models import TableMetadataChunk
 
 load_dotenv(override=True)
 
@@ -19,21 +24,79 @@ SOURCE_DATABASE_URL = os.getenv("SOURCE_DATABASE_URL")
 if not SOURCE_DATABASE_URL:
     raise ValueError("SOURCE_DATABASE_URL is not set")
 
-# Read-only usage only (see _is_safe_select) — for real safety this should
-# also connect as a database role that only has SELECT privilege on these
-# tables, so a mistake here can't be the only line of defense.
-source_engine = create_engine(SOURCE_DATABASE_URL)
+source_engine = create_engine(SOURCE_DATABASE_URL, pool_pre_ping=True)
+
+# Table-metadata embeddings live in the chatbot database (not the source DB),
+# so metadata lookups use the shared session factory from app.database
+# (imported above as _MetaSession). Its engine sets
+# search_path=chatbot,public, which pgvector's "vector" type needs.
+
+# Reflection hits PostgreSQL types SQLAlchemy has no mapping for (point,
+# bpchar, ...). They are harmless here (we only need column names and rough
+# types), so hide the warning instead of flooding the logs on every request.
+warnings.filterwarnings(
+    "ignore", message="Did not recognize type", category=sa_exc.SAWarning
+)
 
 # ---------------------------------------------------------------------------
-# TABLE CATALOG — one entry per table, split into a short "summary" (used
-# for cheap table-routing when the catalog grows) and a full "detail"
-# (the verified schema notes, injected only for tables actually selected as
-# relevant to a given question). This is what lets the system scale to many
-# more tables/databases later without every prompt growing with the whole
-# catalog: only the tables a question actually needs get their full schema
-# sent to the model. Nothing about which tables are relevant is hardcoded —
-# an LLM call decides that per-question, same as SQL generation itself.
+# SETTINGS
 # ---------------------------------------------------------------------------
+
+DEFAULT_SCHEMA = "lb1adm"
+
+# Every schema listed here gets ALL its tables added to the catalog
+# automatically — this is what avoids hand-writing 60-70 table entries.
+# Note the catalog IS the safety allow-list (see _is_safe_select), so this
+# lets generated SQL read every table in these schemas. Put anything
+# sensitive in EXCLUDE_TABLES, and keep the DB role SELECT-only.
+AUTO_DISCOVER_SCHEMAS = ["lb1adm"]
+EXCLUDE_TABLES: set[str] = set()
+
+QUERY_TIMEOUT_MS = 30_000
+
+# ---------------------------------------------------------------------------
+# TABLE CATALOG — every key is optional:
+#   schema   - source schema (defaults to DEFAULT_SCHEMA)
+#   summary  - one-line description for table routing. Auto-built from the
+#              DB if missing.
+#   detail   - hand-written schema notes (gotchas the DB can't tell us,
+#              like "this column is always empty"). Auto-built from
+#              columns/types/PK read from the database if missing.
+#   extra    - extra prompt text added whenever this table is selected
+#              (e.g. a required query pattern).
+#
+# Only these 4 tables have hand-verified detail — real production facts
+# (which columns are actually empty, which FKs are confirmed, required
+# dedup patterns) that no amount of schema-reflection can produce on its
+# own. EVERY OTHER TABLE in lb1adm needs ZERO entry here — it is picked up
+# automatically by AUTO_DISCOVER_SCHEMAS and its schema is read straight
+# from the database. Add a hand-written entry only when a table turns out
+# to need documented gotchas like these.
+# ---------------------------------------------------------------------------
+
+_CTE_PATTERN_TEXT = """
+REQUIRED pattern for any question that both (a) needs distinct wagons
+from p_roams_wagon_master and (b) needs a JOIN, GROUP BY, or aggregate:
+dedupe in its own CTE FIRST, then join/aggregate against that CTE — never
+mix DISTINCT ON with GROUP BY in the same SELECT, and never aggregate
+directly over the raw table without deduping first. Example shape:
+
+  WITH latest_wagons AS (
+    SELECT DISTINCT ON (wagon_no) *
+    FROM lb1adm.p_roams_wagon_master
+    ORDER BY wagon_no, adb_sequence DESC
+  )
+  SELECT t.wagon_type, COUNT(*) AS wagon_count, t.cc_payload_tons
+  FROM latest_wagons w
+  JOIN lb1adm.roams_wagon_type_master t ON w.wagon_type = t.wagon_type
+  WHERE w.wagon_status = 'A'
+  GROUP BY t.wagon_type, t.cc_payload_tons
+  ORDER BY wagon_count DESC
+  LIMIT 5;
+
+Use this same CTE-first shape for any other dedupe+join+aggregate
+question (e.g. counts/lists by owner, by station, by state, by org type).
+"""
 
 TABLE_CATALOG = {
     "fmm_org_m": {
@@ -140,6 +203,7 @@ wagon type.
             "(deduped by wagon_no — see detail for why). Links to type, "
             "owner, and organization/station."
         ),
+        "extra": _CTE_PATTERN_TEXT,
         "detail": """
 lb1adm.p_roams_wagon_master — individual wagon records, one row per
 physical wagon (but see adb_sequence note below — the table holds
@@ -199,80 +263,346 @@ multiple historical versions per wagon, not one row per wagon).
     },
 }
 
-# Verified join keys between tables — used both to build the schema text
-# for a question, and to auto-expand a question's selected tables to
-# include anything they must join to (see _select_relevant_tables). Add
-# new (table_a, table_b) edges here as new tables/joins are verified;
-# nothing else needs to change to support them.
+# Hand-verified join keys: (table_a, column_a, table_b, column_b). Foreign
+# keys declared in the database are discovered automatically (see
+# _get_join_edges), so with 60-70 tables this list only needs entries for
+# joins the database itself doesn't declare (no FK constraint, or FK
+# pointing to a lookup table that isn't in the catalog).
 JOIN_EDGES = [
-    ("p_roams_wagon_master", "roams_wagon_type_master"),
-    ("p_roams_wagon_master", "roams_owner_master"),
-    ("p_roams_wagon_master", "fmm_org_m"),
-    ("roams_owner_master", "fmm_org_m"),
-    ("roams_wagon_type_master", "fmm_org_m"),
+    ("p_roams_wagon_master", "wagon_type", "roams_wagon_type_master", "wagon_type"),
+    ("p_roams_wagon_master", "wagon_owner", "roams_owner_master", "owner_id"),
+    ("p_roams_wagon_master", "org_slno", "fmm_org_m", "org_slno"),
+    ("p_roams_wagon_master", "base_station", "fmm_org_m", "org_slno"),
+    ("p_roams_wagon_master", "roh_stn", "fmm_org_m", "org_slno"),
+    ("p_roams_wagon_master", "poh_stn", "fmm_org_m", "org_slno"),
+    ("roams_owner_master", "org_slno", "fmm_org_m", "org_slno"),
+    ("roams_wagon_type_master", "org_slno", "fmm_org_m", "org_slno"),
 ]
 
-_JOIN_KEY_TEXT = """
-Verified join keys (use these, not other same-named-looking columns):
-  p_roams_wagon_master.wagon_type   = roams_wagon_type_master.wagon_type
-  p_roams_wagon_master.wagon_owner  = roams_owner_master.owner_id
-  p_roams_wagon_master.org_slno     = fmm_org_m.org_slno
-  p_roams_wagon_master.base_station = fmm_org_m.org_slno
-  p_roams_wagon_master.roh_stn      = fmm_org_m.org_slno
-  p_roams_wagon_master.poh_stn      = fmm_org_m.org_slno
-  roams_owner_master.org_slno       = fmm_org_m.org_slno
-  roams_wagon_type_master.org_slno  = fmm_org_m.org_slno
-Any question that spans wagons + their type, wagons + their owner, or
-wagons/owners/types + the organizations/stations they're linked to should
-use these joins.
-"""
-
-_CTE_PATTERN_TEXT = """
-REQUIRED pattern for any question that both (a) needs distinct wagons
-from p_roams_wagon_master and (b) needs a JOIN, GROUP BY, or aggregate:
-dedupe in its own CTE FIRST, then join/aggregate against that CTE — never
-mix DISTINCT ON with GROUP BY in the same SELECT, and never aggregate
-directly over the raw table without deduping first. Example shape:
-
-  WITH latest_wagons AS (
-    SELECT DISTINCT ON (wagon_no) *
-    FROM lb1adm.p_roams_wagon_master
-    ORDER BY wagon_no, adb_sequence DESC
-  )
-  SELECT t.wagon_type, COUNT(*) AS wagon_count, t.cc_payload_tons
-  FROM latest_wagons w
-  JOIN lb1adm.roams_wagon_type_master t ON w.wagon_type = t.wagon_type
-  WHERE w.wagon_status = 'A'
-  GROUP BY t.wagon_type, t.cc_payload_tons
-  ORDER BY wagon_count DESC
-  LIMIT 5;
-
-Use this same CTE-first shape for any other dedupe+join+aggregate
-question (e.g. counts/lists by owner, by station, by state, by org type).
-"""
-
-# Only these tables may ever be queried — this is the safety allow-list
-# and stays independent of whichever subset gets shown to the model for
-# any single question (see _select_relevant_tables below).
-_ALLOWED_TABLES = set(TABLE_CATALOG.keys())
-
-# Below this many tables in the catalog, every table's full schema is just
-# included directly — the extra routing call would add latency/cost for
-# no benefit when there's nothing to filter down. Once the catalog grows
-# past this (more tables, more departments' databases), routing kicks in
-# automatically with no code change needed here.
+# If the catalog has this many tables or fewer, no routing is needed and all
+# tables go straight into the prompt. With 60-70 tables this is always
+# exceeded, so routing is used.
 _ROUTING_THRESHOLD = 6
 
-# A hard cap on rows fetched, applied regardless of what the generated SQL
-# itself asks for — protects against an unexpectedly huge result set
-# blowing up the prompt or the response.
+# The metadata vector search picks this many tables closest to the question
+# (join targets are added on top of these afterwards).
+METADATA_TOP_K = 3
+
+# A text column is treated as "categorical" (and its distinct values are
+# shown to the model) only if it has this many distinct values or fewer.
+# Columns like wagon_no or remarks have thousands of distinct values and are
+# skipped; only small enumerations (type, status, gauge, org_type, ...) qualify.
+LOW_CARDINALITY_MAX_DISTINCT = 50
+
 MAX_RESULT_ROWS = 500
 
 _FORBIDDEN_KEYWORDS = [
     "insert", "update", "delete", "drop", "alter", "truncate", "grant",
-    "revoke", "create", "exec", "execute", "call", "copy", "merge",
-    "--", "/*", "into",
+    "revoke", "create", "exec", "execute", "call", "copy", "merge", "into",
 ]
+_FORBIDDEN_WORD_RE = re.compile(r"\b(?:" + "|".join(_FORBIDDEN_KEYWORDS) + r")\b")
+_FORBIDDEN_TOKENS = ("--", "/*")
+
+# ---------------------------------------------------------------------------
+# CATALOG HELPERS — discovery, schema lookup, reflection from the database.
+# This is what replaces hand-writing 60-70 table entries.
+# ---------------------------------------------------------------------------
+
+_catalog_lock = threading.Lock()
+_catalog_ready = False
+
+_reflect_lock = threading.Lock()
+_reflect_cache: dict[str, dict] = {}
+
+_fk_lock = threading.Lock()
+_fk_edges_cache: Optional[list] = None
+
+# Each table's low-cardinality values are fetched once and cached here, so
+# the database is not queried again for every question.
+_value_lock = threading.Lock()
+_value_cache: dict[str, dict[str, list[str]]] = {}
+
+
+def _ensure_catalog_ready() -> None:
+    """
+    Adds every table from AUTO_DISCOVER_SCHEMAS to the catalog (once).
+    This is the actual "don't hardcode 60-70 tables" mechanism: whatever
+    exists in lb1adm today, or gets added tomorrow, appears here with no
+    code change — sync_master_data.py's own discovery is independent of
+    this, this only controls what generated SQL is allowed to query.
+    """
+    global _catalog_ready
+    if _catalog_ready:
+        return
+    with _catalog_lock:
+        if _catalog_ready:
+            return
+        try:
+            if AUTO_DISCOVER_SCHEMAS:
+                inspector = inspect(source_engine)
+                for schema in AUTO_DISCOVER_SCHEMAS:
+                    for table in inspector.get_table_names(schema=schema):
+                        if table not in TABLE_CATALOG and table not in EXCLUDE_TABLES:
+                            TABLE_CATALOG[table] = {"schema": schema}
+            _catalog_ready = True
+        except Exception as e:
+            logger.warning(f"Table auto-discovery failed: {e}")
+
+
+def _schema_of(table: str) -> str:
+    return TABLE_CATALOG[table].get("schema", DEFAULT_SCHEMA)
+
+
+def _get_reflected(table: str) -> dict:
+    """Columns / primary key / comment for a table, read from the DB once and cached."""
+    with _reflect_lock:
+        cached = _reflect_cache.get(table)
+    if cached is not None:
+        return cached
+
+    meta = {"columns": [], "pk": [], "comment": None}
+    schema = _schema_of(table)
+    try:
+        inspector = inspect(source_engine)
+        for col in inspector.get_columns(table, schema=schema):
+            try:
+                type_name = str(col["type"])
+            except Exception:
+                type_name = "unknown"
+            meta["columns"].append((col["name"], type_name))
+        meta["pk"] = inspector.get_pk_constraint(table, schema=schema).get("constrained_columns") or []
+        try:
+            meta["comment"] = inspector.get_table_comment(table, schema=schema).get("text")
+        except Exception:
+            meta["comment"] = None
+    except Exception as e:
+        logger.warning(f"Could not read schema of {schema}.{table}: {e}")
+
+    with _reflect_lock:
+        _reflect_cache[table] = meta
+    return meta
+
+
+# Text/varchar SQLAlchemy type names worth a low-cardinality check. Numeric,
+# date, boolean, jsonb and array types are skipped: they never have a
+# "Northern Railway" vs "NR" style mismatch.
+_CATEGORICAL_TYPE_PREFIXES = ("VARCHAR", "CHAR", "TEXT", "ENUM")
+
+
+def _get_low_cardinality_values(table: str) -> dict[str, list[str]]:
+    """
+    For every text column of the table, returns its distinct values if
+    there are LOW_CARDINALITY_MAX_DISTINCT or fewer. This lets the model map
+    "Northern Railway" in a question to the value actually stored in the DB
+    (e.g. "NR") without embedding or chunking any row data. It is a cheap
+    live lookup, only on small enumeration-like columns, run once per table
+    and then cached.
+
+    The query is bounded: GROUP BY ... LIMIT (max+1) means a
+    high-cardinality column (wagon_no, remarks, address) never needs a full
+    distinct count; as soon as more than the limit is seen, the column is
+    skipped.
+    """
+    with _value_lock:
+        cached = _value_cache.get(table)
+    if cached is not None:
+        return cached
+
+    meta = _get_reflected(table)
+    schema = _schema_of(table)
+    preparer = source_engine.dialect.identifier_preparer
+    table_sql = f"{preparer.quote_schema(schema)}.{preparer.quote(table)}"
+
+    result: dict[str, list[str]] = {}
+    try:
+        with source_engine.connect() as conn:
+            for col_name, type_name in meta["columns"]:
+                if not type_name.upper().startswith(_CATEGORICAL_TYPE_PREFIXES):
+                    continue
+                col_sql = preparer.quote(col_name)
+                try:
+                    rows = conn.execute(
+                        text(
+                            f"SELECT {col_sql} FROM {table_sql} "
+                            f"WHERE {col_sql} IS NOT NULL "
+                            f"GROUP BY {col_sql} "
+                            f"LIMIT {LOW_CARDINALITY_MAX_DISTINCT + 1}"
+                        )
+                    ).fetchall()
+                except Exception as e:
+                    logger.warning(f"Distinct-value check failed for {table}.{col_name}: {e}")
+                    continue
+
+                if 0 < len(rows) <= LOW_CARDINALITY_MAX_DISTINCT:
+                    result[col_name] = sorted(str(r[0]) for r in rows)
+    except Exception as e:
+        logger.warning(f"Low-cardinality scan failed for {table}: {e}")
+
+    with _value_lock:
+        _value_cache[table] = result
+    return result
+
+
+def _get_table_summary(table: str) -> str:
+    """One-line description used for cheap table routing (see _ROUTING_THRESHOLD)."""
+    info = TABLE_CATALOG[table]
+    if info.get("summary"):
+        return info["summary"]
+
+    meta = _get_reflected(table)
+    parts = []
+    if meta["comment"]:
+        parts.append(meta["comment"].strip())
+    if meta["columns"]:
+        parts.append("Columns: " + ", ".join(name for name, _ in meta["columns"][:15]))
+    return " ".join(parts) or f"Table {table}"
+
+
+def _get_table_detail(table: str) -> str:
+    """Full schema text: hand-written if provided, otherwise built entirely from the DB."""
+    info = TABLE_CATALOG[table]
+    if info.get("detail"):
+        base = info["detail"]
+    else:
+        meta = _get_reflected(table)
+        description = info.get("summary") or meta["comment"] or "no description available"
+        lines = [f"{_schema_of(table)}.{table} — {description}"]
+        if meta["pk"]:
+            lines.append(f"  primary key: {', '.join(meta['pk'])}")
+        if meta["columns"]:
+            lines.append("  columns: " + ", ".join(f"{name} ({type_name})" for name, type_name in meta["columns"]))
+        if info.get("notes"):
+            lines.append("  notes: " + info["notes"].strip())
+        base = "\n".join(lines) + "\n"
+
+    # Append the actually stored values of small enumeration-like text columns
+    # (type, status, gauge, org_type, ...). This makes the model write
+    # `= 'NR'` instead of `= 'Northern Railway'` when the question uses the
+    # full name but the DB stores a short code.
+    categorical_values = _get_low_cardinality_values(table)
+    if categorical_values:
+        value_lines = [
+            f"  {col} actual stored values: {', '.join(repr(v) for v in values)}"
+            for col, values in categorical_values.items()
+        ]
+        base += "\n" + "\n".join(value_lines) + "\n"
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# METADATA EMBEDDING — only table metadata (name, description, columns) is
+# embedded, never row data. sync_master_data.py takes the text from here,
+# embeds it and stores it in chatbot.table_metadata_chunks.
+# ---------------------------------------------------------------------------
+
+def _build_metadata_text(table: str) -> str:
+    """Metadata text for one table: schema-qualified name, description, column names."""
+    info = TABLE_CATALOG[table]
+    meta = _get_reflected(table)
+
+    description = info.get("summary") or (meta["comment"] or "").strip()
+    column_names = ", ".join(name for name, _ in meta["columns"])
+
+    parts = [f"Table: {_schema_of(table)}.{table}"]
+    if description:
+        parts.append(f"Description: {description}")
+    if column_names:
+        parts.append(f"Columns: {column_names}")
+    return "\n".join(parts)
+
+
+def get_catalog_metadata_texts() -> dict[str, str]:
+    """
+    Returns {"schema.table": metadata_text} for every table in the catalog.
+    Called by sync_master_data.py.
+    """
+    _ensure_catalog_ready()
+    return {
+        f"{_schema_of(table)}.{table}": _build_metadata_text(table)
+        for table in list(TABLE_CATALOG)
+    }
+
+
+def _search_tables_by_metadata(question: str, k: int = METADATA_TOP_K) -> set[str]:
+    """
+    Finds the k tables closest to the question embedding (cosine distance
+    over table_metadata_chunks). On any error, or if the table is empty,
+    returns an empty set so the caller can fall back to LLM routing.
+    """
+    try:
+        question_embedding = generate_query_embedding(question)
+        db = _MetaSession()
+        try:
+            rows = (
+                db.query(TableMetadataChunk.source_table)
+                .filter(TableMetadataChunk.embedding.isnot(None))
+                .order_by(TableMetadataChunk.embedding.cosine_distance(question_embedding))
+                .limit(k)
+                .all()
+            )
+        finally:
+            db.close()
+
+        picked: set[str] = set()
+        for (ref,) in rows:
+            schema, _, table = ref.partition(".")
+            if table in TABLE_CATALOG and _schema_of(table) == schema:
+                picked.add(table)
+        return picked
+    except Exception as e:
+        logger.warning(f"Metadata vector search failed, falling back to LLM routing: {e}")
+        return set()
+
+
+def _get_join_edges() -> list:
+    """Hand-verified JOIN_EDGES plus single-column foreign keys declared in the DB itself."""
+    global _fk_edges_cache
+    _ensure_catalog_ready()
+
+    with _fk_lock:
+        if _fk_edges_cache is None:
+            discovered = []
+            try:
+                inspector = inspect(source_engine)
+                for table in list(TABLE_CATALOG):
+                    for fk in inspector.get_foreign_keys(table, schema=_schema_of(table)):
+                        if len(fk["constrained_columns"]) != 1 or len(fk["referred_columns"]) != 1:
+                            continue
+                        referred = fk["referred_table"]
+                        if referred in TABLE_CATALOG:
+                            discovered.append(
+                                (table, fk["constrained_columns"][0], referred, fk["referred_columns"][0])
+                            )
+            except Exception as e:
+                logger.warning(f"Foreign-key discovery failed: {e}")
+            _fk_edges_cache = discovered
+        discovered = _fk_edges_cache
+
+    merged = []
+    seen = set()
+    for a, ca, b, cb in list(JOIN_EDGES) + discovered:
+        key = frozenset([(a, ca), (b, cb)])
+        if key not in seen:
+            seen.add(key)
+            merged.append((a, ca, b, cb))
+    return merged
+
+
+def _build_join_text(tables: set[str]) -> str:
+    lines = [
+        f"  {a}.{ca} = {b}.{cb}"
+        for a, ca, b, cb in _get_join_edges()
+        if a in tables and b in tables
+    ]
+    if not lines:
+        return ""
+    return (
+        "\nVerified join keys (use these, not other same-named-looking columns):\n"
+        + "\n".join(lines)
+        + "\nAny question that needs data from more than one of the tables above"
+        " should use these joins.\n"
+    )
 
 
 class TableSelection(BaseModel):
@@ -290,61 +620,55 @@ class TableSelection(BaseModel):
 
 def _select_relevant_tables(question: str) -> set[str]:
     """
-    Cheap first pass over just table names + one-line summaries (not full
-    schemas) to figure out which tables a question actually needs. This
-    is what keeps prompt size bounded as more tables/databases get added
-    later — instead of every question paying for every table's full
-    schema, only the relevant ones do.
+    This is what keeps the prompt from ballooning with 60-70 tables: only
+    the full schema of the 2-3 relevant tables goes into the SQL-writing
+    prompt.
 
-    Below _ROUTING_THRESHOLD tables, this is skipped entirely and all
-    tables are used (identical to today's behavior) — the extra LLM round
-    trip only starts happening once there's an actual catalog to filter.
+    The first routing method is METADATA VECTOR SEARCH (matching the
+    question embedding against table_metadata_chunks), which needs no LLM
+    call. If it finds nothing (empty table, sync not run, or an error), the
+    older LLM routing is used as a fallback, and if that fails too, all
+    tables are used.
 
-    Falls back to "all tables" on any failure or empty result, since
-    over-including schema is always safe (just less efficient), while
-    under-including could silently break a valid cross-table question.
+    After selection, join targets are added so cross-table questions do not
+    miss a table they need.
     """
+    _ensure_catalog_ready()
+
     if len(TABLE_CATALOG) <= _ROUTING_THRESHOLD:
         return set(TABLE_CATALOG.keys())
 
-    catalog_text = "\n".join(
-        f"- {name}: {info['summary']}" for name, info in TABLE_CATALOG.items()
-    )
+    selected = _search_tables_by_metadata(question)
 
-    prompt = f"""
-    Here is a catalog of available database tables:
-
-    {catalog_text}
-
-    Question: {question}
-
-    Which of these tables (by exact name) are relevant to answering this
-    question, either directly or as a join target for another relevant
-    table?
-    """
-
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": TableSelection,
-            },
+    if not selected:
+        catalog_text = "\n".join(
+            f"- {name}: {_get_table_summary(name)}" for name in TABLE_CATALOG
         )
-        selected = set(json.loads(response.text).get("relevant_tables") or [])
-        selected = {t for t in selected if t in TABLE_CATALOG}
-    except Exception as e:
-        logger.warning(f"Table selection failed, falling back to full catalog: {e}")
-        selected = set()
+
+        prompt = f"""
+        Here is a catalog of available database tables:
+
+        {catalog_text}
+
+        Question: {question}
+
+        Which of these tables (by exact name) are relevant to answering this
+        question, either directly or as a join target for another relevant
+        table?
+        """
+
+        try:
+            selected = set(generate_json(prompt, TableSelection).get("relevant_tables") or [])
+            selected = {t for t in selected if t in TABLE_CATALOG}
+        except Exception as e:
+            logger.warning(f"Table selection failed, falling back to full catalog: {e}")
+            selected = set()
 
     if not selected:
         return set(TABLE_CATALOG.keys())
 
-    # Expand one hop along verified joins, so a cross-table question isn't
-    # broken just because the classifier only named one side of the join.
     expanded = set(selected)
-    for a, b in JOIN_EDGES:
+    for a, _ca, b, _cb in _get_join_edges():
         if a in selected:
             expanded.add(b)
         if b in selected:
@@ -354,66 +678,87 @@ def _select_relevant_tables(question: str) -> set[str]:
 
 
 def _build_schema_text(tables: set[str]) -> str:
-    parts = [TABLE_CATALOG[t]["detail"] for t in TABLE_CATALOG if t in tables]
-    if len(tables) > 1:
-        parts.append(_JOIN_KEY_TEXT)
-    if "p_roams_wagon_master" in tables:
-        parts.append(_CTE_PATTERN_TEXT)
+    parts = [_get_table_detail(t) for t in TABLE_CATALOG if t in tables]
+
+    join_text = _build_join_text(tables)
+    if join_text:
+        parts.append(join_text)
+
+    for t in TABLE_CATALOG:
+        if t in tables and TABLE_CATALOG[t].get("extra"):
+            parts.append(TABLE_CATALOG[t]["extra"])
+
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# SQL SAFETY
+# ---------------------------------------------------------------------------
+
+_SCAN_NOISE_RE = re.compile(r"\b(extract|substring|trim|overlay)\s*\(([^()]*?)\bfrom\b")
+_TABLE_REF_RE = re.compile(r"\b(?:from|join)\s+(?:(\w+)\.)?(\w+)")
+
+
+def _referenced_tables(sql: str) -> list[tuple[Optional[str], str]]:
+    lowered = sql.strip().rstrip(";").strip().lower()
+
+    scan_text = _SCAN_NOISE_RE.sub(r"\1(\2", lowered)
+    scan_text = re.sub(r"\bdistinct\s+from\b", "distinct", scan_text)
+
+    cte_names = set(re.findall(r"(\w+)\s+as\s*\(", lowered))
+
+    seen = set()
+    ordered = []
+    for schema, table in _TABLE_REF_RE.findall(scan_text):
+        schema = schema or None
+        if schema is None and table in cte_names:
+            continue
+        key = (schema, table)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
 
 
 def _is_safe_select(sql: str) -> bool:
     """
-    Validates that `sql` is a single, read-only SELECT (optionally with a
-    leading WITH/CTE) statement touching only known tables. This is the
-    actual safety boundary for running LLM-generated SQL — nothing here
-    trusts the model's own judgment about what's safe. Checked against the
-    FULL catalog's allow-list regardless of which subset was shown to the
-    model for this particular question.
+    Validates that `sql` is a single, read-only SELECT touching only
+    catalog tables. Checked against the FULL catalog (all 60-70 discovered
+    tables), regardless of which subset was shown to the model.
     """
+    _ensure_catalog_ready()
+
     stripped = sql.strip().rstrip(";").strip()
     lowered = stripped.lower()
 
     if not lowered.startswith("select") and not lowered.startswith("with"):
         return False
     if ";" in stripped:
-        # A second statement snuck in after the trailing semicolon we
-        # already stripped — reject rather than guess which part is real.
         return False
-    if any(kw in lowered for kw in _FORBIDDEN_KEYWORDS):
+    if any(token in lowered for token in _FORBIDDEN_TOKENS):
+        return False
+    if _FORBIDDEN_WORD_RE.search(lowered):
         return False
 
-    referenced_tables = re.findall(r"(?:from|join)\s+(?:lb1adm\.)?(\w+)", lowered)
-    if not referenced_tables:
+    referenced = _referenced_tables(sql)
+    if not referenced:
         return False
-    # A CTE name referenced later in the query (e.g. "FROM latest_wagons")
-    # is not a real table and must not be checked against _ALLOWED_TABLES.
-    cte_names = set(re.findall(r"(\w+)\s+as\s*\(", lowered))
-    real_tables = [t for t in referenced_tables if t not in cte_names]
-    if not real_tables:
-        return False
-    return all(t in _ALLOWED_TABLES for t in real_tables)
 
-
+    for schema, table in referenced:
+        if table not in TABLE_CATALOG:
+            return False
+        if schema is not None and schema != _schema_of(table).lower():
+            return False
+    return True
 
 
 def _extract_referenced_tables(sql: str) -> list[str]:
-    """
-    Pulls out the real table names a query touches (excluding CTE names),
-    for display purposes — e.g. building a human-readable "source" label.
-    Shares the same extraction logic _is_safe_select uses for validation.
-    """
-    lowered = sql.strip().rstrip(";").strip().lower()
-    referenced_tables = re.findall(r"(?:from|join)\s+(?:lb1adm\.)?(\w+)", lowered)
-    cte_names = set(re.findall(r"(\w+)\s+as\s*\(", lowered))
-    real_tables = [t for t in referenced_tables if t not in cte_names]
-    # Preserve first-seen order, drop duplicates
     seen = set()
     ordered_unique = []
-    for t in real_tables:
-        if t not in seen:
-            seen.add(t)
-            ordered_unique.append(t)
+    for _schema, table in _referenced_tables(sql):
+        if table not in seen:
+            seen.add(table)
+            ordered_unique.append(table)
     return ordered_unique
 
 
@@ -423,10 +768,8 @@ class SQLQueryPlan(BaseModel):
             "True if this question can be answered by querying the railway "
             "master-data tables directly — counts, lists, filters, "
             "summaries, distributions, aggregates, lookups by name/code, "
-            "date-based calculations (e.g. codal life due dates), or "
-            "cross-table joins the schema below can express, including "
-            "questions that require combining information from more than "
-            "one of these tables. False if the question is about an "
+            "date-based calculations, or cross-table joins the schema "
+            "below can express. False if the question is about an "
             "uploaded document/manual/procedure, or is a general question "
             "unrelated to this data."
         )
@@ -436,35 +779,18 @@ class SQLQueryPlan(BaseModel):
         description=(
             "A single, read-only PostgreSQL SELECT statement (a WITH ... "
             "SELECT CTE counts as one statement; table names "
-            "schema-qualified as lb1adm.<table>) that answers the "
-            "question. Required if can_answer_with_sql is True; otherwise "
-            "omit."
+            "schema-qualified exactly as shown in the schema, i.e. "
+            "<schema>.<table>) that answers the question. Required if "
+            "can_answer_with_sql is True; otherwise omit."
         ),
     )
 
 
-# ---------------------------------------------------------------------------
-# SQL generation cache — caches the generated SQL (not the final answer;
-# data changes over time, so the answer is always re-computed by re-running
-# the SQL and re-summarizing fresh rows). What's expensive and safe to
-# reuse is the LLM figuring out WHICH tables are relevant and HOW to write
-# the SQL — that logic depends on the schema, which barely ever changes,
-# not on the data inside it.
-#
-# This is a simple exact/near-duplicate cache (same question text,
-# normalized) — it will NOT catch differently-worded questions that mean
-# the same thing (e.g. "how many BOXNM2 wagons" vs "how many wagons of
-# type BOXNM2" normalize to two different strings and will both miss). A
-# semantic cache (embedding-based similarity lookup against previously
-# cached questions) would catch more repeats, at the cost of needing a
-# small vector index and a tuned similarity threshold — worth adding later
-# if this simple version isn't cutting enough LLM calls in practice.
-# ---------------------------------------------------------------------------
-_SQL_CACHE_TTL_SECONDS = 6 * 60 * 60  # schema-driven, so a long TTL is safe
+_SQL_CACHE_TTL_SECONDS = 6 * 60 * 60
 _SQL_CACHE_MAX_ENTRIES = 500
 
 _sql_cache: dict[str, dict] = {}
-_sql_cache_order: list[str] = []  # tracks insertion order for FIFO eviction
+_sql_cache_order: list[str] = []
 _sql_cache_lock = threading.Lock()
 
 
@@ -501,30 +827,14 @@ def _store_cached_plan(question: str, plan: dict) -> None:
 
 
 def generate_sql_query(question: str) -> Optional[dict]:
-    """
-    Asks the LLM to decide whether `question` is answerable from the
-    master-data tables, and if so, to write the SQL for it — rather than
-    matching the question against a fixed set of hand-written patterns
-    (which can only ever cover the cases someone thought to anticipate).
-    Any count, list, filter, join across tables, date calculation, or
-    cross-field summary is handled by the same mechanism, because the LLM
-    is writing real SQL against the real, verified schema, not being
-    routed through pre-defined categories.
-
-    The schema text itself is built per-question from only the tables
-    _select_relevant_tables() decides are relevant — see that function's
-    docstring for why this matters as the table catalog grows.
-
-    A cache is checked first (see _get_cached_plan) — a repeat or
-    near-identical question skips BOTH the table-selection call and the
-    SQL-writing call entirely.
-    """
     if not question or not question.strip():
         return None
 
     cached_plan = _get_cached_plan(question)
     if cached_plan is not None:
         return cached_plan
+
+    _ensure_catalog_ready()
 
     relevant_tables = _select_relevant_tables(question)
     schema_text = _build_schema_text(relevant_tables)
@@ -536,27 +846,25 @@ def generate_sql_query(question: str) -> Optional[dict]:
 
     Question: {question}
 
-        Decide whether this question can be answered by querying the tables
+    Decide whether this question can be answered by querying the tables
     above. If yes, write ONE single PostgreSQL SELECT statement (a WITH/CTE
     prefix is fine and encouraged — see the required dedupe pattern above,
     if shown) that answers it. Use the verified join keys listed above
     whenever the question spans more than one table — do not invent other
     join columns, and never join to a table that isn't one shown above
     (some columns reference external lookup tables that are explicitly
-    called out as not queryable — treat those as plain codes). When a
-    question needs both deduping p_roams_wagon_master AND a JOIN/GROUP BY/
-    aggregate, follow the required CTE-first pattern shown above exactly
-    — do not combine DISTINCT ON with GROUP BY in the same SELECT level.
+    called out as not queryable — treat those as plain codes). If a
+    required query pattern is shown above for a table, follow it exactly.
     Use unnest() for array columns when their contents matter, and
-    ->>'key' for incharge_details fields. Never write more than one
+    ->>'key' for JSON/JSONB fields. Always write table names
+    schema-qualified, exactly as shown above. Never write more than one
     statement, and never write anything other than a SELECT (with an
     optional WITH prefix).
 
     For any comparison against a free-text or high-cardinality categorical
-    column (state_name, district_name, org_desc, station_name, owner_name,
-    wagon_description, rake_type, stock_type, location_type, etc.), always
-    use case-insensitive matching (ILIKE, not =), since the underlying
-    data may be stored in mixed, inconsistent, or slightly messy form.
+    column, always use case-insensitive matching (ILIKE, not =), since the
+    underlying data may be stored in mixed, inconsistent, or slightly
+    messy form.
 
     If none of the tables shown above can answer this question — for
     example if it's about an uploaded document/manual/procedure, or is
@@ -565,23 +873,15 @@ def generate_sql_query(question: str) -> Optional[dict]:
     """
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": SQLQueryPlan,
-            },
-        )
-        plan = json.loads(response.text)
+        plan = generate_json(prompt, SQLQueryPlan)
+    except LLMUnavailableError:
+        # Do not turn an AI-service outage into a fake "no answer found";
+        # let the API layer report it as a 503.
+        raise
     except Exception as e:
         logger.warning(f"SQL plan generation failed: {e}")
         return None
 
-    # Only cache a plan that actually resolved to real SQL — caching a
-    # "can't answer this" result would wrongly stick if the schema/catalog
-    # is expanded later to cover it (a false negative is worse to cache
-    # than a false positive, since a cache-miss just costs one extra call).
     if plan.get("can_answer_with_sql") and plan.get("sql"):
         _store_cached_plan(question, plan)
 
@@ -591,23 +891,15 @@ def generate_sql_query(question: str) -> Optional[dict]:
 def execute_sql_query(sql: str) -> list[dict]:
     cleaned = sql.strip().rstrip(";")
     with source_engine.connect() as conn:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text(f"SET LOCAL statement_timeout = {int(QUERY_TIMEOUT_MS)}"))
         result = conn.execute(text(cleaned))
         columns = result.keys()
-        # fetchmany caps the result regardless of what the query itself
-        # specifies (e.g. no LIMIT, or a very large one).
         rows = result.fetchmany(MAX_RESULT_ROWS)
         return [dict(zip(columns, row)) for row in rows]
 
 
 def summarize_sql_results(question: str, sql: str, rows: list[dict]) -> str:
-    """
-    Turns the raw SQL result into a natural-language answer. The model
-    only sees the query and its actual returned rows — it isn't asked to
-    recall or infer anything beyond what's in front of it, so the answer
-    stays grounded in the real result set (including its true size, since
-    MAX_RESULT_ROWS caps what's fetched but COUNT()-based questions return
-    their exact total as a single row anyway).
-    """
     if not rows:
         return "NOT_FOUND"
 
@@ -622,51 +914,41 @@ def summarize_sql_results(question: str, sql: str, rows: list[dict]) -> str:
     It returned {len(rows)} row(s):
     {rows_text}
 
-    Using ONLY this result, answer the question in clear natural language.
+    Using ONLY this result, answer the question.
+
+    FORMAT RULE: if the result has more than one row AND more than one
+    column, format the answer as a Markdown table (with a header row),
+    optionally preceded by one short sentence of context. If the result
+    is a single value (e.g. a count) or a single row, answer in a plain
+    sentence instead — do not build a table for that case.
 
     IMPORTANT: rows were actually returned, so this question DOES have an
     answer — do not respond with "NOT_FOUND" just because some requested
     field is NULL/missing for some or all rows. In that case, still answer
     using whatever fields ARE populated, and explicitly say which
-    requested field was not available (e.g. "state and district are not
-    recorded for these owners"). Reserve "NOT_FOUND" strictly for cases
-    where these specific rows are about a completely different entity than
-    what was asked (e.g. the question asks for X but every returned row is
-    about Y, with no X-related column at all) — never for missing/NULL
-    values within an otherwise relevant result.
+    requested field was not available. Reserve "NOT_FOUND" strictly for
+    cases where these specific rows are about a completely different
+    entity than what was asked — never for missing/NULL values within an
+    otherwise relevant result.
 
     Question: {question}
     """
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"temperature": 0},
-        )
-        return (response.text or "").strip()
+        return generate_text(prompt)
+    except LLMUnavailableError:
+        raise
     except Exception as e:
         logger.warning(f"summarize_sql_results failed: {e}")
         return "NOT_FOUND"
 
 
 def answer_master_data_query(question: str) -> Optional[dict]:
-    """
-    Full pipeline: route -> classify -> validate -> execute -> summarize.
-    Returns None at any point the question isn't a master-data SQL
-    question, the generated SQL fails validation, execution errors out, or
-    the result doesn't actually answer the question — in every such case
-    the caller should fall back to normal chunk-based retrieval instead of
-    surfacing a broken structured-query attempt.
-    """
     plan = generate_sql_query(question)
     if not plan or not plan.get("can_answer_with_sql") or not plan.get("sql"):
         return None
 
     sql = plan["sql"]
-    # Re-validated even for a cache hit — cheap (no LLM call), and guards
-    # against a future code change to _ALLOWED_TABLES making an old cached
-    # query unsafe/out of scope.
     if not _is_safe_select(sql):
         logger.warning(f"Rejected unsafe or out-of-scope generated SQL: {sql!r}")
         return None

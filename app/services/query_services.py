@@ -1,30 +1,40 @@
 import logging
 import uuid
 from typing import Literal
+
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from app.models import ChatMessage, Document
+from app.services.llm_service import (
+    expand_query_for_retrieval,
+    generate_answer,
+    rewrite_query_with_history,
+)
 from app.services.retrieval_services import retrieve_relevant_chunks
-from app.services.llm_service import generate_answer, rewrite_query_with_history, expand_query_for_retrieval
 from app.services.sql_query_services import answer_master_data_query
-from app.models import ChatMessage, Document, Chunk, MasterDataChunk
 
 logger = logging.getLogger(__name__)
 
 MAX_ROUNDS = 4
 CHUNKS_PER_ROUND = 15
-HISTORY_TURNS = 3
+HISTORY_TURNS = 3  # NEW: how many previous question/answer pairs are remembered for follow-ups
 
-# "documents"   -> only uploaded PDFs/images
-# "master_data" -> only database master tables
-# "both"        -> both
 QuerySource = Literal["documents", "master_data", "both"]
+
+_NOT_FOUND_MESSAGES = {
+    "documents": "I could not find a clear answer to this question in the uploaded documents.",
+    "master_data": "I could not find a clear answer to this question in the master data records.",
+    "both": "I could not find a clear answer to this question in the uploaded documents or the master data records.",
+}
 
 
 def _get_recent_history(conversation_id: str, db: Session) -> list[dict]:
+    """NEW: the last HISTORY_TURNS question/answer pairs of this conversation, oldest first."""
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
-        .order_by(ChatMessage.created_at.desc())
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
         .limit(HISTORY_TURNS * 2)
         .all()
     )
@@ -32,22 +42,35 @@ def _get_recent_history(conversation_id: str, db: Session) -> list[dict]:
     return [{"role": m.role, "content": m.content} for m in messages]
 
 
-def _save_message(conversation_id: str, role: str, content: str, db: Session) -> None:
-    db.add(ChatMessage(conversation_id=conversation_id, role=role, content=content))
-    db.commit()
+def _save_exchange(conversation_id: str, query: str, result: dict, db: Session) -> None:
+    """
+    NEW: saves the user's question and the assistant's answer. The answer
+    must still reach the user even if saving the history fails, so a failure
+    here is only logged.
+    """
+    try:
+        db.add(ChatMessage(conversation_id=conversation_id, role="user", content=query))
+        db.add(
+            ChatMessage(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=result["answer"],
+                sources=result.get("sources") or [],
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning("Could not save chat history: %s", e)
 
 
 def _build_sources(chunks: list, used_refs: set, db: Session) -> list[dict]:
     """
-    `chunks` can contain both Chunk (uploaded documents) and
-    MasterDataChunk (database master tables) objects, so each chunk's type
-    is checked to build the appropriately shaped source dict.
-
-    `used_refs` is the set of 1-based REF numbers (a chunk's position in
-    `chunks`) that generate_answer() reported as actually used — this
-    tells us exactly which chunks the LLM relied on for the final answer.
+    Builds the source list for the REFs the model actually used. Only Chunk
+    (uploaded document) objects reach this function — the master-data path
+    builds its own source dicts in sql_query_services.answer_master_data_query.
     """
-    document_ids = {c.document_id for c in chunks if isinstance(c, Chunk)}
+    document_ids = {c.document_id for c in chunks}
     documents = (
         db.query(Document).filter(Document.id.in_(document_ids)).all()
         if document_ids else []
@@ -61,86 +84,61 @@ def _build_sources(chunks: list, used_refs: set, db: Session) -> list[dict]:
         if ref_num not in used_refs:
             continue
 
-        if isinstance(chunk, Chunk):
-            key = ("document", chunk.document_id, chunk.page_number)
-            if key in seen:
-                continue
-            seen.add(key)
+        key = (chunk.document_id, chunk.page_number)
+        if key in seen:
+            continue
+        seen.add(key)
 
-            document = documents_by_id.get(chunk.document_id)
+        document = documents_by_id.get(chunk.document_id)
 
-            # If this document came from CRIS and has its original public URL
-            # stored, use that directly (already-hosted, no auth needed).
-            # Otherwise (e.g. an admin-uploaded document with no public URL),
-            # fall back to our own download endpoint.
-            if document and document.source_url:
-                download_url = document.source_url
-            else:
-                download_url = f"/documents/{chunk.document_id}/download"
+        if document and document.source_url:
+            download_url = document.source_url
+        else:
+            download_url = f"/documents/{chunk.document_id}/download"
 
-            sources.append({
-                "type": "document",
-                "document_id": chunk.document_id,
-                "page_number": chunk.page_number,
-                "filename": document.filename if document else None,
-                "download_url": download_url,
-            })
-
-        elif isinstance(chunk, MasterDataChunk):
-            key = ("master_data", chunk.source_table, chunk.record_id)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            sources.append({
-                "type": "master_data",
-                "source_table": chunk.source_table,
-                "record_id": chunk.record_id,
-            })
+        sources.append({
+            "type": "document",
+            "document_id": chunk.document_id,
+            "page_number": chunk.page_number,
+            "filename": document.filename if document else None,
+            "download_url": download_url,
+        })
 
     return sources
 
 
-def answer_query(
-    query: str,
+def _run_query(
+    standalone_query: str,
+    history: list[dict],
     db: Session,
-    top_k: int = CHUNKS_PER_ROUND,
-    conversation_id: str | None = None,
-    source: QuerySource = "both",
+    top_k: int,
+    source: QuerySource,
 ) -> dict:
-    if not conversation_id:
-        conversation_id = str(uuid.uuid4())
-
-    # History and the standalone rewrite now happen BEFORE the SQL branch.
-    # Previously, a follow-up like "list them" or "but there were 208 of
-    # them?" was sent to answer_master_data_query() as raw text, with no
-    # idea what "them" referred to, because the rewrite only happened
-    # later in the document-retrieval path. Doing it here first means both
-    # the SQL path and the document path get a fully resolved, standalone
-    # question.
-    history = _get_recent_history(conversation_id, db)
-    standalone_query = rewrite_query_with_history(query, history)
-
-    # Any question about the master-data tables — a specific lookup, a
-    # whole-table or category count/list, or a cross-field summary — is
-    # tried via text-to-SQL first: the LLM writes real SQL against the
-    # actual schema instead of being matched against pre-defined question
-    # patterns, so this isn't limited to categories anyone anticipated.
-    # Falls through to chunk-based retrieval below if the question isn't
-    # about this data, or SQL generation/execution/summarization fails.
+    """
+    CHANGED: the body of the old answer_query lives here, with the same
+    logic. The only differences are that retrieval/SQL use the standalone
+    query, and generate_answer also receives the history.
+    """
+    # Master-data questions are answered ONLY via live SQL — there is no
+    # row-level embedding fallback for this source. If SQL can't answer it,
+    # a master_data-only request goes straight to the NOT_FOUND message.
     if source in ("master_data", "both"):
         sql_result = answer_master_data_query(standalone_query)
         if sql_result is not None:
-            _save_message(conversation_id, "user", query, db)
-            _save_message(conversation_id, "assistant", sql_result["answer"], db)
-            sql_result["conversation_id"] = conversation_id
             return sql_result
 
+    if source == "master_data":
+        return {
+            "answer": _NOT_FOUND_MESSAGES["master_data"],
+            "sources": [],
+            "rounds_used": 0,
+        }
+
+    # The chunk-retrieval path below covers UPLOADED DOCUMENTS only,
+    # regardless of the caller's `source`.
     retrieval_query = expand_query_for_retrieval(standalone_query)
 
-    _save_message(conversation_id, "user", query, db)
-
-    seen_chunk_ids: list[str] = []
+    seen_chunk_ids: list[int] = []
 
     for round_num in range(1, MAX_ROUNDS + 1):
         chunks = retrieve_relevant_chunks(
@@ -148,63 +146,63 @@ def answer_query(
             db,
             top_k=top_k,
             exclude_ids=seen_chunk_ids,
-            source=source,
-            # Keyword matching uses the pre-expansion question, not the
-            # embedding-oriented expanded one — expansion adds extra
-            # generic terms that would otherwise dilute an exact literal
-            # match (e.g. a specific company or wagon-type name).
             keyword_query=standalone_query,
         )
 
         if not chunks:
-            logger.debug(f"Round {round_num}: no more chunks left to search.")
+            logger.debug("Round %d: no more chunks left to search.", round_num)
             break
 
-        # Prefix with type so retrieval_services' exclude_ids logic filters
-        # each subsequent round against the *right* table (master vs doc).
-        for chunk in chunks:
-            if isinstance(chunk, MasterDataChunk):
-                seen_chunk_ids.append(f"master:{chunk.id}")
-            else:
-                seen_chunk_ids.append(f"doc:{chunk.id}")
+        seen_chunk_ids.extend(c.id for c in chunks)
 
-        try:
-            result = generate_answer(query, chunks, history=history)
-        except Exception as e:
-            logger.warning(f"Round {round_num}: generation failed — {e}")
-            continue
+        result = generate_answer(standalone_query, chunks, history=history)
 
         if result["answer"].strip().upper() != "NOT_FOUND":
             used_refs = set(result.get("refs_used", []))
-            final_answer = result["answer"]
-
-            _save_message(conversation_id, "assistant", final_answer, db)
-
             return {
-                "answer": final_answer,
+                "answer": result["answer"],
                 "sources": _build_sources(chunks, used_refs, db),
                 "rounds_used": round_num,
-                "conversation_id": conversation_id,
             }
 
-    fallback_answer = "I could not find a clear answer to this question in the uploaded documents."
-    _save_message(conversation_id, "assistant", fallback_answer, db)
-
     return {
-        "answer": fallback_answer,
+        "answer": _NOT_FOUND_MESSAGES.get(source, _NOT_FOUND_MESSAGES["both"]),
         "sources": [],
         "rounds_used": MAX_ROUNDS,
-        "conversation_id": conversation_id,
     }
 
 
+def answer_query(
+    query: str,
+    db: Session,
+    top_k: int = CHUNKS_PER_ROUND,
+    source: QuerySource = "both",
+    conversation_id: str | None = None,
+) -> dict:
+    """
+    Answers one question. If a conversation_id is given, the earlier turns of
+    that conversation are remembered (for follow-up questions); otherwise a
+    new conversation starts, and its conversation_id is returned in the
+    response.
+
+    Raises LLMUnavailableError (from llm_service) if Gemini cannot be
+    reached; the API layer turns that into a 503.
+    """
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+
+    history = _get_recent_history(conversation_id, db)
+    standalone_query = rewrite_query_with_history(query, history)
+
+    result = _run_query(standalone_query, history, db, top_k, source)
+
+    _save_exchange(conversation_id, query, result, db)
+    result["conversation_id"] = conversation_id
+    return result
+
+
 def list_conversations(db: Session) -> list[dict]:
-    """
-    For the sidebar — each conversation_id's first user message becomes
-    its "title", and the most recent message's timestamp becomes
-    "last_updated_at". Most recently updated conversation comes first,
-    same as Claude's sidebar.
-    """
+    """NEW: all conversations for the sidebar, newest first. The title is the first message."""
     conversation_stats = (
         db.query(
             ChatMessage.conversation_id,
@@ -251,15 +249,11 @@ def list_conversations(db: Session) -> list[dict]:
 
 
 def get_conversation_messages(conversation_id: str, db: Session) -> list[dict]:
-    """
-    All messages for one conversation, in chronological (oldest-first)
-    order — used when the user clicks an old chat in the sidebar, to load
-    its full history into the frontend.
-    """
+    """NEW: all messages of one conversation, oldest first."""
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         .all()
     )
 
@@ -267,6 +261,7 @@ def get_conversation_messages(conversation_id: str, db: Session) -> list[dict]:
         {
             "role": m.role,
             "content": m.content,
+            "sources": m.sources,
             "created_at": m.created_at,
         }
         for m in messages

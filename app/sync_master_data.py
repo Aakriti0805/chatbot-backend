@@ -1,318 +1,167 @@
-import os
-import json
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+import datetime
+import sys
 
-from app.models import MasterDataChunk
+from app.database import SessionLocal, engine
+from app.models import TableMetadataChunk
 from app.services.embedding_service import generate_embeddings
+from app.services.sql_query_services import get_catalog_metadata_texts
+
+# Kept as an alias so older imports (`from app.sync_master_data import
+# dest_engine`) keep working. It is the shared engine from app.database,
+# which already sets search_path=chatbot,public (needed because pgvector's
+# "vector" type lives in the chatbot schema, not public).
+dest_engine = engine
+DestSessionLocal = SessionLocal
+
+# Number of tables whose metadata is embedded in one batch. Each table's
+# metadata text is short, so this is plenty.
+EMBEDDING_BATCH_SIZE = 32
 
 
-load_dotenv(override=True)
-
-SOURCE_DATABASE_URL = os.getenv("SOURCE_DATABASE_URL")
-DEST_DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not SOURCE_DATABASE_URL:
-    raise ValueError("SOURCE_DATABASE_URL is not set")
-
-if not DEST_DATABASE_URL:
-    raise ValueError("DATABASE_URL is not set")
-
-
-source_engine = create_engine(SOURCE_DATABASE_URL)
-
-
-dest_engine = create_engine(
-    DEST_DATABASE_URL,
-    connect_args={"options": "-csearch_path=chatbot,public"},
-)
-
-DestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=dest_engine)
-
-# Ek baar mein kitne texts embed karne hain — pehli sync pe hazaaron rows
-# hote hain, isliye chhote batches mein karte hain taaki memory/time ka issue na aaye.
-EMBEDDING_BATCH_SIZE = 256
-
-
-def _clean(value) -> str:
-    """None/empty values ko literal 'null' bana deta hai, taaki header ke
-    saath value hamesha chunk mein dikhe (jaise 'mf_recv_rly - null')."""
-    if value is None or str(value).strip() == "":
-        return "null"
-    return str(value).strip()
-
-
-def _row_to_text_generic(row: dict, columns: list[str]) -> str:
+def parse_table_ref(ref: str) -> tuple[str, str]:
     """
-    Row ke saare columns ko raw 'column_name - value' format mein, comma
-    se separated likhta hai — koi translation/paraphrasing nahi, taaki CSV
-    ki exact terminology se bhi retrieval match ho sake.
+    Splits "schema.table" into (schema, table). A name without a schema is
+    rejected on purpose: the source DB has ~20 schemas and the same table
+    name can exist in several of them, so guessing the schema could sync
+    the wrong table.
     """
-    return ", ".join(f"{col} - {_clean(row.get(col))}" for col in columns)
+    if "." not in ref:
+        raise ValueError(
+            f"Table ref '{ref}' must be schema-qualified, e.g. 'lb1adm.roams_owner_master'"
+        )
+    schema, table = ref.split(".", 1)
+    schema, table = schema.strip(), table.strip()
+    if not schema or not table:
+        raise ValueError(f"Invalid table ref: {ref!r}")
+    return schema, table
 
 
-OWNER_MASTER_COLUMNS = [
-    "owner_id", "owner_name", "numeric_code", "address", "type",
-    "created_by", "created_on", "modified_by", "modified_on",
-    "valid_flag", "rb_owner_id", "fois_owner_id", "platform", "org_slno",
-]
-
-WAGON_TYPE_MASTER_COLUMNS = [
-    "wagon_type", "wagon_description", "wagon_class_group", "numerical_code",
-    "tare_tons", "cc_payload_tons", "axle_load", "bearing_type", "coupling_type",
-    "bogie_type", "brake_type", "first_poh_duration", "next_poh_duration",
-    "first_roh_duration", "next_roh_duration", "codal_life", "gauge",
-    "avg_no_of_wagon_in_rake", "wagon_type_display_name", "no_of_wheels",
-    "drawing_no", "valid_flag", "mcdo_flag", "old_wagon_type", "created_by",
-    "created_on", "being_manufactured", "rly_pvt_owned", "platform",
-    "updated_by", "updated_on", "org_slno", "mcdo_wagon_type", "vehicle_type",
-    "rake_type", "prd_flag", "stock_type", "fois_mutiplication_factor",
-    "groupname", "cvdtype", "img_url", "identification_desc",
-    "first_allot_letter_image_url", "sample_image_url", "commercial_notif_no",
-    "commercial_notif_date", "sr_no_in_commercial_notif", "remarks",
-    "commercial_letter_image_url", "subsequent_poh_cycle_roh_duraton",
-    "ir_empty_speed", "ir_loaded_speed", "color_code_speed", "speed_consent",
-    "dfcc_empty_speed", "dfcc_loaded_speed", "brake_type_design",
-    "universal_roh_duration",
-]
-
-# incharge_details JSON column ko alag se handle karte hain (flatten karke),
-# isliye ise generic list mein nahi, row_to_text_org_m() mein alag jodte hain.
-ORG_M_COLUMNS = [
-    "org_slno", "org_code", "org_type", "org_desc", "org_seq", "prnt_org_slno",
-    "num_code", "pvt_rly", "created_by", "created_on", "modified_by",
-    "modified_on", "valid_flag", "manufacturer", "edrishti_dk",
-    "district_name", "state_name", "gis_coord", "gis_flag", "remarks",
-    "depot_rb_2017", "depot_rb_2008", "station_name", "man_power_flag",
-    "mf_recv_rly", "dispatch_for_flag", "location_type",
-    "org_slno_category", "rs_type_attended", "maintenance_activities_available",
-]
-
-# Baaki adb_* columns (adb_opcode, adb_subject, etc.) jaan-boojh ke nahi liye —
-# ye replication/CDC ke internal columns hain, embedding mein noise banayenge.
-# Sirf adb_sequence aur adb_timestamp rakhe hain, kyunki ek wagon_id ke multiple
-# versions hain aur inse pata chalta hai ki kaunsa version kab ka hai (latest kaunsa).
-P_WAGON_MASTER_COLUMNS = [
-    "wagon_id", "wagon_no", "record_created_person", "wagon_type", "po_number",
-    "tare", "manufacturer_date", "original_cost", "mf_id", "warranty_end_date",
-    "manufacturer_country", "diagram_number", "manufacturer_serial_number",
-    "commission_date", "commission_station", "wagon_owner",
-    "wagon_carrying_capacity", "scheme_name", "pipe_fitted", "wagon_status",
-    "base_station", "organization_type", "valid_flag", "roh_stn", "roh_date",
-    "poh_stn", "poh_date", "brake_type", "rfid1", "rfid2", "poh_return_date",
-    "pvt_vehicle_no", "rb_wagon_id", "intrm_remarks", "org_slno",
-    "pvt_owner_code", "wagon_usage", "lessor_flag", "agreement_wagon_pool",
-    "wagon_no_old", "update_in_no_type_owner",
-    "adb_sequence", "adb_timestamp",
-]
+def _ensure_metadata_table() -> None:
+    """Creates the table_metadata_chunks table if it does not exist yet."""
+    TableMetadataChunk.__table__.create(bind=dest_engine, checkfirst=True)
 
 
-def row_to_text_owner_master(row: dict) -> str:
-    return _row_to_text_generic(row, OWNER_MASTER_COLUMNS)
-
-
-def row_to_text_wagon_type_master(row: dict) -> str:
-    return _row_to_text_generic(row, WAGON_TYPE_MASTER_COLUMNS)
-
-
-def row_to_text_p_wagon_master(row: dict) -> str:
-    return _row_to_text_generic(row, P_WAGON_MASTER_COLUMNS)
-
-
-def row_to_text_org_m(row: dict) -> str:
-    base_text = _row_to_text_generic(row, ORG_M_COLUMNS)
-
-    # incharge_details JSON ko flatten karke uske andar ke keys ko literal
-    # naam ke saath jodte hain (contactNo, inchargeName, etc.)
-    incharge_fields = "null"
-    raw_incharge = row.get("incharge_details")
-    if raw_incharge:
-        try:
-            details = raw_incharge if isinstance(raw_incharge, dict) else json.loads(raw_incharge)
-            address_obj = details.get("officePostalAddress") or {}
-            incharge_fields = (
-                f"inchargeName - {_clean(details.get('inchargeName'))}, "
-                f"inchargeDesignation - {_clean(details.get('inchargeDesignation'))}, "
-                f"contactNo - {_clean(details.get('contactNo'))}, "
-                f"city - {_clean(address_obj.get('city'))}, "
-                f"state - {_clean(address_obj.get('state'))}, "
-                f"pincode - {_clean(address_obj.get('pincode'))}"
-            )
-        except Exception:
-            incharge_fields = "null"
-
-    return f"{base_text}, incharge_details - ({incharge_fields})"
-
-
-MASTER_TABLE_CONFIGS = [
-    {
-        "source_table": "roams_owner_master",
-        "primary_key": "owner_id",
-        "query": f"""
-            SELECT {", ".join(f'"{c}"' if c == "type" else c for c in OWNER_MASTER_COLUMNS)}
-            FROM lb1adm.roams_owner_master
-        """,
-        "row_to_text": row_to_text_owner_master,
-    },
-    {
-        "source_table": "roams_wagon_type_master",
-        "primary_key": "wagon_type",
-        "query": f"""
-            SELECT {", ".join(WAGON_TYPE_MASTER_COLUMNS)}
-            FROM lb1adm.roams_wagon_type_master
-        """,
-        "row_to_text": row_to_text_wagon_type_master,
-    },
-    {
-        "source_table": "fmm_org_m",
-        "primary_key": "org_slno",
-        "query": f"""
-            SELECT {", ".join(ORG_M_COLUMNS)}, incharge_details
-            FROM lb1adm.fmm_org_m
-        """,
-        "row_to_text": row_to_text_org_m,
-    },
-    {
-        "source_table": "p_roams_wagon_master",
-        # Har row ka alag version chahiye (wagon_id same hota hai, baaki details
-        # alag), isliye adb_sequence (source mein unique index wala column) ko
-        # record_id bana rahe hain, taaki koi row skip na ho.
-        "primary_key": "adb_sequence",
-        "query": f"""
-            SELECT {", ".join(P_WAGON_MASTER_COLUMNS)}
-            FROM lb1adm.p_roams_wagon_master
-            ORDER BY adb_sequence
-        """,
-        "row_to_text": row_to_text_p_wagon_master,
-    },
-]
-
-
-def _fetch_source_rows(config: dict) -> list[dict]:
-    with source_engine.connect() as conn:
-        result = conn.execute(text(config["query"]))
-        columns = result.keys()
-        return [dict(zip(columns, row)) for row in result.fetchall()]
-
-
-def sync_master_table(config: dict, db) -> dict:
+def _sync_refs(refs: list[str], catalog_texts: dict[str, str], db) -> list[dict]:
     """
-    Ek master table ke saare rows sync karta hai: naya row insert, badla
-    hua row update (embedding regenerate karke), unchanged row skip.
-    Har batch ke baad commit hota hai, isliye beech mein ruk jaye to dobara
-    run karne pe wahin se resume hota hai.
+    Embeds and upserts the metadata of `refs`. A table whose text is
+    unchanged and already has an embedding is not embedded again.
     """
-    source_table = config["source_table"]
-    primary_key = config["primary_key"]
-
-    rows = _fetch_source_rows(config)
-    print(f"  Fetched {len(rows)} rows from {source_table}")
-
-    # Same primary key wale rows ko dedupe karte hain (safety ke liye) — jo row
-    # baad mein aati hai wahi rakhte hain. p_roams_wagon_master mein primary key
-    # adb_sequence unique hai, isliye wahan koi row skip nahi hogi.
-    unique_rows = {}
-    for row in rows:
-        record_id = str(row.get(primary_key))
-        if not record_id or record_id == "None":
-            continue
-        unique_rows[record_id] = row
-
-    duplicates_skipped = len(rows) - len(unique_rows)
-    if duplicates_skipped:
-        print(f"  Skipped {duplicates_skipped} duplicate/null-key rows in {source_table}")
-
-    existing_chunks = {
-        c.record_id: c
-        for c in db.query(MasterDataChunk)
-        .filter(MasterDataChunk.source_table == source_table)
+    existing = {
+        c.source_table: c
+        for c in db.query(TableMetadataChunk)
+        .filter(TableMetadataChunk.source_table.in_(refs))
         .all()
     }
 
-    inserted = 0
-    updated = 0
-    unchanged = 0
+    status: dict[str, str] = {}
+    pending = []  # rows that need a new embedding
 
-    texts_to_embed = []
-    chunks_needing_embedding = []
+    for ref in refs:
+        new_text = catalog_texts[ref]
+        row = existing.get(ref)
 
-    for record_id, row in unique_rows.items():
-        new_text = config["row_to_text"](row)
-        existing = existing_chunks.get(record_id)
-
-        if existing is None:
-            new_chunk = MasterDataChunk(
-                source_table=source_table,
-                record_id=record_id,
-                text=new_text,
-            )
-            # db.add yahan nahi karte — embedding ban jaane ke baad hi add karenge,
-            # warna beech mein commit hone pe bina embedding wale rows save ho jayenge
-            # aur agle run mein 'unchanged' maan liye jayenge.
-            texts_to_embed.append(new_text)
-            chunks_needing_embedding.append(new_chunk)
-            inserted += 1
-        elif existing.text != new_text or existing.embedding is None:
-            # embedding None wale rows (pichhle adhoore run se) bhi dobara embed honge
-            existing.text = new_text
-            existing.embedding = None
-            texts_to_embed.append(new_text)
-            chunks_needing_embedding.append(existing)
-            updated += 1
+        if row is None:
+            pending.append(TableMetadataChunk(source_table=ref, text=new_text))
+            status[ref] = "inserted"
+        elif row.text != new_text or row.embedding is None:
+            row.text = new_text
+            row.embedding = None
+            pending.append(row)
+            status[ref] = "updated"
         else:
-            unchanged += 1
+            status[ref] = "unchanged"
 
-    if texts_to_embed:
-        total = len(texts_to_embed)
-        for i in range(0, total, EMBEDDING_BATCH_SIZE):
-            batch_texts = texts_to_embed[i:i + EMBEDDING_BATCH_SIZE]
-            batch_chunks = chunks_needing_embedding[i:i + EMBEDDING_BATCH_SIZE]
-            embeddings = generate_embeddings(batch_texts)
-            for chunk, embedding in zip(batch_chunks, embeddings):
-                chunk.embedding = embedding
-                db.add(chunk)
-            # Har batch ke baad commit, taaki beech mein ruk jaye to progress save rahe
-            db.commit()
-            print(f"  Embedded + saved {min(i + EMBEDDING_BATCH_SIZE, total)}/{total}")
-    else:
+    for start in range(0, len(pending), EMBEDDING_BATCH_SIZE):
+        batch = pending[start:start + EMBEDDING_BATCH_SIZE]
+        embeddings = generate_embeddings([r.text for r in batch])
+        for row, embedding in zip(batch, embeddings):
+            row.embedding = embedding
+            row.updated_at = datetime.datetime.utcnow()
+            db.add(row)
         db.commit()
+        print(f"    {min(start + EMBEDDING_BATCH_SIZE, len(pending))}/{len(pending)} tables embedded")
 
-    print(f"  {source_table}: inserted={inserted}, updated={updated}, unchanged={unchanged}")
+    db.commit()
 
-    return {"source_table": source_table, "inserted": inserted, "updated": updated, "unchanged": unchanged}
+    return [
+        {
+            "source_table": ref,
+            "inserted": int(status[ref] == "inserted"),
+            "updated": int(status[ref] == "updated"),
+            "unchanged": int(status[ref] == "unchanged"),
+        }
+        for ref in refs
+    ]
 
 
-def run_master_data_sync() -> dict:
+def run_master_data_sync(table_refs: list[str] | None = None) -> dict:
     """
-    Saare configured master tables ko sync karta hai. CLI se ya FastAPI
-    background task se, dono jagah se reusable.
+    Embeds ONLY table metadata (name, description, columns) into
+    chatbot.table_metadata_chunks — never row data.
+
+    - If table_refs is given ("schema.table" format), only those tables are
+      synced (they must exist in the catalog).
+    - If table_refs is empty/None, ALL catalog tables are synced, and the
+      metadata of tables that are no longer in the catalog is removed.
     """
     print("=" * 70)
-    print("MASTER DATA SYNC -> chatbot.master_data_chunks")
+    print("TABLE METADATA SYNC -> chatbot.table_metadata_chunks")
     print("=" * 70)
+
+    catalog_texts = get_catalog_metadata_texts()
+    full_sync = not table_refs
+
+    if full_sync:
+        refs = list(catalog_texts.keys())
+        print(f"Full sync: {len(refs)} tables in the catalog")
+    else:
+        print(f"Requested: {table_refs}")
+        refs = []
+        for ref in table_refs:
+            try:
+                schema, table = parse_table_ref(ref)
+            except Exception as e:
+                print(f"  -> Skipping '{ref}': {e}")
+                continue
+            key = f"{schema}.{table}"
+            if key not in catalog_texts:
+                print(f"  -> Skipping '{key}': this table is not in the catalog")
+                continue
+            refs.append(key)
+
+    _ensure_metadata_table()
 
     db = DestSessionLocal()
-    results = []
-
     try:
-        for config in MASTER_TABLE_CONFIGS:
-            print(f"\nSyncing {config['source_table']}...")
-            try:
-                results.append(sync_master_table(config, db))
-            except Exception as e:
-                print(f"  -> Failed to sync {config['source_table']}: {e}")
-                db.rollback()
+        results = _sync_refs(refs, catalog_texts, db) if refs else []
 
-        print("\n" + "=" * 70)
-        print("MASTER DATA SYNC COMPLETED")
+        if full_sync:
+            stale = (
+                db.query(TableMetadataChunk)
+                .filter(~TableMetadataChunk.source_table.in_(list(catalog_texts.keys())))
+                .all()
+            )
+            for row in stale:
+                db.delete(row)
+            db.commit()
+            if stale:
+                print(f"  Removed stale metadata: {[r.source_table for r in stale]}")
+
+        inserted = sum(r["inserted"] for r in results)
+        updated = sum(r["updated"] for r in results)
+        unchanged = sum(r["unchanged"] for r in results)
+        print(f"\nDone: inserted={inserted}, updated={updated}, unchanged={unchanged}")
         print("=" * 70)
-
         return {"tables": results}
-
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    run_master_data_sync()
+    # Usage:
+    #   python -m app.sync_master_data                      -> all catalog tables
+    #   python -m app.sync_master_data lb1adm.roams_owner_master lb1adm.fmm_org_m
+    run_master_data_sync(sys.argv[1:] or None)

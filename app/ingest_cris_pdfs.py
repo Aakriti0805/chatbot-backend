@@ -2,9 +2,9 @@ import os
 import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
 from urllib.parse import urlparse, unquote
 
+from app.database import SessionLocal
 from app.models import Document, Chunk
 from app.services.textextraction_service import process_file
 from app.services.document_services import process_document
@@ -24,20 +24,12 @@ if not DEST_DATABASE_URL:
 
 source_engine = create_engine(SOURCE_DATABASE_URL)
 
-# search_path is needed here because pgvector's "vector" type lives in the
-# chatbot schema (not public). Without it, SQLAlchemy's bulk-insert
-# query-path (inserting many chunks at once) throws "type vector does not
-# exist" — this already happened once, on a 45-chunk document.
-dest_engine = create_engine(
-    DEST_DATABASE_URL,
-    connect_args={"options": "-csearch_path=chatbot,public"},
-)
-
-DestSessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=dest_engine
-)
+# The destination DB uses the shared session factory from app.database. Its
+# engine already sets search_path=chatbot,public, which pgvector's "vector"
+# type needs (the type lives in the chatbot schema, not public). Without it,
+# SQLAlchemy's bulk insert of many chunks fails with "type vector does not
+# exist" (this happened once, on a 45-chunk document).
+DestSessionLocal = SessionLocal
 
 
 DOWNLOAD_DIR = "uploaded_files/cris_sync"

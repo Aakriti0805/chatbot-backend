@@ -1,9 +1,11 @@
-from app.database import Base
-from sqlalchemy import DateTime
 import datetime
-from pgvector.sqlalchemy import Vector #type: ignore
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, UniqueConstraint
+
+from pgvector.sqlalchemy import Vector  # type: ignore
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
+
+from app.database import Base
+
 
 class Document(Base):
     __tablename__ = "documents"
@@ -36,11 +38,31 @@ class Chunk(Base):
     document = relationship("Document", back_populates="chunks")
 
 
+class TableMetadataChunk(Base):
+    """
+    Metadata of every source-database table (table name, description,
+    columns) — not row data. One row per table. At text-to-SQL time the
+    question is matched against these embeddings to find which 2-3 tables
+    are relevant.
+
+    source_table is schema-qualified, e.g. "lb1adm.roams_owner_master".
+    """
+    __tablename__ = "table_metadata_chunks"
+    __table_args__ = {"schema": "chatbot"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_table = Column(String, unique=True, index=True, nullable=False)
+    text = Column(Text, nullable=False)
+    embedding = Column(Vector(1024))
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class ChatMessage(Base):
     """
-    Stores conversation history. Each user question and its assistant
-    answer is saved as a separate row, grouped by conversation_id.
-    This table is what makes follow-up questions "remember" earlier turns.
+    NEW: Conversation history. Each user question and its assistant answer
+    is saved as a separate row, grouped by conversation_id. This table is
+    what lets follow-up questions "remember" earlier turns. The columns
+    match the existing chatbot.chat_messages table in the database.
     """
     __tablename__ = "chat_messages"
     __table_args__ = {"schema": "chatbot"}
@@ -50,27 +72,5 @@ class ChatMessage(Base):
     role = Column(String, nullable=False)  # "user" or "assistant"
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-
-class MasterDataChunk(Base):
-    """
-    Structured master-data tables (owner master, wagon type master, org
-    master, etc.) se aayi rows ka embedded text. Ek row = ek chunk —
-    page-splitting ki zaroorat nahi, kyunki har row already ek chhota,
-    atomic fact hai (jaise ek owner ka poora record).
-
-    source_table + record_id ka combination unique hai, isse upsert
-    (dobara sync chalane par sirf changed rows update hoti hain) possible
-    hota hai.
-    """
-    __tablename__ = "master_data_chunks"
-    __table_args__ = (
-        UniqueConstraint("source_table", "record_id", name="uq_master_data_source_record"),
-        {"schema": "chatbot"},
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    source_table = Column(String, nullable=False)  # e.g. "roams_owner_master"
-    record_id = Column(String, nullable=False)      # source table's primary key value
-    text = Column(Text, nullable=False)
-    embedding = Column(Vector(1024))
+    user_id = Column(String, nullable=True)
+    sources = Column(JSON, nullable=True)  # citations returned with the assistant's answer
